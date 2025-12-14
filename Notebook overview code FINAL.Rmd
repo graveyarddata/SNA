@@ -1,0 +1,885 @@
+---
+title: "R code Nickel trade"
+output: html_document
+date: "2025-12-02"
+---
+
+Set up data
+
+```{r load in data}
+csv_path <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/TradeData_nickel.csv"
+weight_var <- "primaryValue"
+drop_aggregates <- TRUE
+
+epi_path  <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/EPI_data.xlsx"
+gdp_path  <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/GDP_data.xlsx"
+lsci_path <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/LSCI.csv"
+
+
+ev_path   <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/TradeData_EV_exports.csv"
+batt_path <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/TradeData_Battery_exports.csv"
+dist_path <- "C:/Users/verab/OneDrive - TU Eindhoven/MSc Data Science in Business and Entrepeneurship/Social Network Analysis/SNA4DSproject/Data/dist_cepii.dta"
+
+```
+
+
+
+```{r initialize network}
+## ------- Helpers -------
+safe_lower_trim <- function(x) {
+  x <- as.character(x)
+  x <- iconv(x, from = "", to = "UTF-8", sub = "")     # normalize to UTF-8
+  x <- gsub("\\p{Cf}", "", x, perl = TRUE)             # strip control/format chars
+  x <- gsub("\u00A0", " ", x, fixed = TRUE)            # NBSP -> space
+  x <- trimws(x)
+  tolower(x)
+}
+
+map_to_iso3 <- function(country_vec, lookup_iso_by_name, custom_match = NULL) {
+  x <- safe_lower_trim(country_vec)
+  out <- rep(NA_character_, length(x))
+  
+  if (!is.null(custom_match)) {
+    cm_names <- safe_lower_trim(names(custom_match))
+    hit <- match(x, cm_names, nomatch = 0L)
+    has <- hit > 0L
+    if (any(has)) out[has] <- unname(custom_match[hit[has]])
+  }
+  
+  need <- is.na(out)
+  if (any(need)) out[need] <- lookup_iso_by_name[x[need]]
+  out
+}
+
+## ------- READ TRADE DATA -------
+df <- readr::read_csv(csv_path, guess_max = 1e6, show_col_types = FALSE)
+
+## ------- CLEAN EDGES (base R) -------
+edges <- data.frame(
+  from   = as.character(df$reporterISO),
+  to     = as.character(df$partnerISO),
+  weight = df[[weight_var]],
+  stringsAsFactors = FALSE
+)
+
+# Drop NAs and self-loops
+good <- stats::complete.cases(edges) & edges$from != edges$to
+edges <- edges[good, , drop = FALSE]
+
+# Remove aggregates
+if (isTRUE(drop_aggregates)) {
+  bad <- c("W00","_X","S19")
+  edges <- edges[!(edges$from %in% bad | edges$to %in% bad), , drop = FALSE]
+}
+
+# Merge duplicates (sum weights)
+edges <- stats::aggregate(weight ~ from + to, data = edges, FUN = function(z) sum(z, na.rm = TRUE))
+
+## Top 15 trade flows
+cat("\nTop 15 trade flows\n")
+ord <- order(edges$weight, decreasing = TRUE)
+print(utils::head(edges[ord, ], 15))
+
+## ------- BUILD NETWORK -------
+all_nodes <- sort(unique(c(edges$from, edges$to)))
+A <- matrix(0, nrow = length(all_nodes), ncol = length(all_nodes),
+            dimnames = list(all_nodes, all_nodes))
+
+if (nrow(edges) > 0) {
+  idx_from <- match(edges$from, all_nodes)
+  idx_to   <- match(edges$to,   all_nodes)
+  for (k in seq_len(nrow(edges))) {
+    A[idx_from[k], idx_to[k]] <- A[idx_from[k], idx_to[k]] + edges$weight[k]
+  }
+}
+
+nickel <- igraph::graph_from_adjacency_matrix(A, mode = "directed", weighted = TRUE, diag = FALSE)
+
+# Remove XX node if present
+if ("XX" %in% igraph::V(nickel)$name) {
+  nickel <- igraph::delete_vertices(nickel, "XX")
+  cat("Removed node: XX\n")
+}
+
+## ------- COUNTRY NAMES LOOKUP (from trade file) -------
+lookup_all <- unique(rbind(
+  data.frame(ISO = df$reporterISO, Country = df$reporterDesc, stringsAsFactors = FALSE),
+  data.frame(ISO = df$partnerISO,  Country = df$partnerDesc,  stringsAsFactors = FALSE)
+))
+lookup_all <- lookup_all[stats::complete.cases(lookup_all), , drop = FALSE]
+
+match_idx <- match(igraph::V(nickel)$name, lookup_all$ISO)
+igraph::V(nickel)$country_name <- lookup_all$Country[match_idx]
+
+# Build name -> ISO3 dict safely
+lookup_all$lc <- safe_lower_trim(lookup_all$Country)
+lookup_iso_by_name <- stats::setNames(lookup_all$ISO, lookup_all$lc)
+
+# Synonyms
+custom_syn <- c(
+  "united states of america"="USA","united states"="USA",
+  "cote d'ivoire"="CIV","côte d'ivoire"="CIV",
+  "republic of congo"="COG","congo, rep."="COG","republic of the congo"="COG",
+  "dem. rep. congo"="COD","congo, dem. rep."="COD","democratic republic of the congo"="COD",
+  "korea, rep."="KOR","republic of korea"="KOR","south korea"="KOR", "Rep.  of Korea" = "KOR",
+  "russian federation"="RUS","viet nam"="VNM","eswatini"="SWZ",
+  "bahamas, the"="BHS","gambia, the"="GMB","kosovo"="XKX",
+  "egypt, arab rep."="EGY","kyrgyz republic"="KGZ", # NEW FIXES FOR MISSING DATA:
+  "turkiye" = "TUR", "türkiye" = "TUR", "turkey" = "TUR",
+  "bolivia" = "BOL", "bolivia (plurinational state of)" = "BOL",
+  "china, hong kong sar" = "HKG", "hong kong sar, china" = "HKG", "hong kong" = "HKG",
+  "macau" = "MAC", "macao" = "MAC",
+  "solomon islands" = "SLB", "solomon isds" = "SLB",
+  "cayman islands" = "CYM", "cayman isds" = "CYM",
+  "new caledonia" = "NCL",
+  "tanzania" = "TZA", "united republic of tanzania" = "TZA", "united rep. of tanzania" = "TZA",
+  "netherlands (kingdom of the)" = "NLD", "netherlands" = "NLD",
+  "czechia" = "CZE", "czech republic" = "CZE",
+  "slovakia" = "SVK", "slovak republic" = "SVK",
+  "serbia and montenegro" = "SRB", "russia"="RUS" # Note: Older LSCI might group them, but mapping to SRB is a safe approximation
+)
+
+```
+
+```{r node attributes}
+
+## ------- NODE ATTRIBUTES: EPI -------
+epi_raw <- readxl::read_excel(epi_path)
+nm <- safe_lower_trim(names(epi_raw))
+
+cand_country <- which(nm %in% c("country","country name","country_name","economy","nation"))[1]
+if (is.na(cand_country)) cand_country <- which(grepl("country|nation|econom", nm))[1]
+
+cand_score <- which(nm %in% c("score","epi","epi score","epi_score","value"))[1]
+if (is.na(cand_score)) cand_score <- which(grepl("score|epi", nm))[1]
+
+if (is.na(cand_country) || is.na(cand_score)) {
+  stop("Could not auto-detect EPI columns. Found: ",
+       paste(names(epi_raw), collapse = ", "),
+       "\nPlease set cand_country/cand_score manually.")
+}
+
+epi_country <- as.character(epi_raw[[cand_country]])
+epi_score   <- suppressWarnings(as.numeric(gsub("[^0-9.-]", "", epi_raw[[cand_score]])))
+
+keep <- !is.na(epi_country) & !is.na(epi_score)
+epi_country <- epi_country[keep]
+epi_score   <- epi_score[keep]
+
+epi_iso3 <- map_to_iso3(epi_country, lookup_iso_by_name, custom_match = custom_syn)
+
+dedup <- !duplicated(epi_iso3) & !is.na(epi_iso3)
+epi_tab <- data.frame(iso3 = epi_iso3[dedup], epi_score = epi_score[dedup], stringsAsFactors = FALSE)
+
+match_epi <- match(igraph::V(nickel)$name, epi_tab$iso3)
+igraph::V(nickel)$epi_score <- epi_tab$epi_score[match_epi]
+cat("EPI matched:", sum(!is.na(igraph::V(nickel)$epi_score)), "/", igraph::vcount(nickel), "\n")
+
+## ------- NODE ATTRIBUTES: GDP -------
+gdp_raw <- readxl::read_excel(gdp_path)
+
+country_col <- "Country Name"
+gdp_col     <- "GDP"
+if (!(country_col %in% names(gdp_raw)) || !(gdp_col %in% names(gdp_raw))) {
+  stop("Expected columns 'Country Name' and 'GDP' not found in GDP file.")
+}
+
+gdp_country <- as.character(gdp_raw[[country_col]])
+gdp_usd     <- suppressWarnings(as.numeric(gsub("[^0-9.-]", "", gdp_raw[[gdp_col]])))
+
+keep <- !is.na(gdp_country)
+gdp_country <- gdp_country[keep]
+gdp_usd     <- gdp_usd[keep]
+
+# Drop some legacy/aggregate rows if present (by name)
+drop_names <- c("Netherlands Antilles","Serbia and Montenegro")
+drop_idx <- safe_lower_trim(gdp_country) %in% safe_lower_trim(drop_names)
+gdp_country <- gdp_country[!drop_idx]
+gdp_usd     <- gdp_usd[!drop_idx]
+
+gdp_iso3 <- map_to_iso3(gdp_country, lookup_iso_by_name, custom_match = custom_syn)
+
+dedup <- !duplicated(gdp_iso3) & !is.na(gdp_iso3) & !is.na(gdp_usd)
+gdp_tab <- data.frame(iso3 = gdp_iso3[dedup], gdp_usd = gdp_usd[dedup], stringsAsFactors = FALSE)
+
+match_gdp <- match(igraph::V(nickel)$name, gdp_tab$iso3)
+igraph::V(nickel)$gdp_usd <- gdp_tab$gdp_usd[match_gdp]
+
+## ------- NODE ATTRIBUTES: LSCI -------
+lsci_raw <- readr::read_csv(lsci_path, show_col_types = FALSE)
+
+# First column = country; last numeric column = index
+lsci_country_col <- names(lsci_raw)[1]
+num_cols <- vapply(lsci_raw, is.numeric, logical(1))
+lsci_value_col   <- names(lsci_raw)[max(which(num_cols))]
+
+lsci_country <- as.character(lsci_raw[[lsci_country_col]])
+lsci_value   <- suppressWarnings(as.numeric(lsci_raw[[lsci_value_col]]))
+
+keep <- !is.na(lsci_country) & !is.na(lsci_value)
+lsci_country <- lsci_country[keep]
+lsci_value   <- lsci_value[keep]
+
+lsci_iso3 <- map_to_iso3(lsci_country, lookup_iso_by_name, custom_match = custom_syn)
+
+dedup <- !duplicated(lsci_iso3) & !is.na(lsci_iso3)
+lsci_tab <- data.frame(iso3 = lsci_iso3[dedup], lsci = lsci_value[dedup], stringsAsFactors = FALSE)
+
+match_lsci <- match(igraph::V(nickel)$name, lsci_tab$iso3)
+igraph::V(nickel)$lsci <- lsci_tab$lsci[match_lsci]
+
+## ------- NODE ATTRIBUTES: EV EXPORTS (HS 870380, UN Comtrade) -------
+
+# EV exports file: Vehicles; with only electric motor for propulsion
+ev_raw <- readr::read_csv(ev_path, guess_max = 1e6, show_col_types = FALSE)
+
+# Drop possible aggregate reporter codes, just to be safe
+drop_iso <- c("W00", "_X", "S19")
+ev_raw <- ev_raw[!(ev_raw$reporterISO %in% drop_iso), , drop = FALSE]
+
+# Aggregate FOB export values by reporter ISO (one row per reporter, but this is safe)
+ev_tab <- stats::aggregate(fobvalue ~ reporterISO,
+                           data = ev_raw,
+                           FUN = function(z) sum(z, na.rm = TRUE))
+names(ev_tab)[names(ev_tab) == "fobvalue"] <- "ev_export_fob"
+
+# Match to graph vertices (nickel network uses ISO3 names as vertex names)
+match_ev <- match(igraph::V(nickel)$name, ev_tab$reporterISO)
+igraph::V(nickel)$ev_export <- ev_tab$ev_export_fob[match_ev]
+
+# Optional: log-transform to reduce skew (will be handy for models)
+igraph::V(nickel)$ln_ev_export <- log(igraph::V(nickel)$ev_export + 1)
+
+## ------- NODE ATTRIBUTES: BATTERY EXPORTS (Li-ion, HS 850760, UN Comtrade) -------
+
+# Li-ion battery exports file: Electric accumulators; lithium-ion...
+batt_raw <- readr::read_csv(batt_path, guess_max = 1e6, show_col_types = FALSE)
+
+batt_raw <- batt_raw[!(batt_raw$reporterISO %in% drop_iso), , drop = FALSE]
+
+batt_tab <- stats::aggregate(fobvalue ~ reporterISO,
+                             data = batt_raw,
+                             FUN = function(z) sum(z, na.rm = TRUE))
+names(batt_tab)[names(batt_tab) == "fobvalue"] <- "batt_export_fob"
+
+match_batt <- match(igraph::V(nickel)$name, batt_tab$reporterISO)
+igraph::V(nickel)$batt_export <- batt_tab$batt_export_fob[match_batt]
+
+igraph::V(nickel)$ln_batt_export <- log(igraph::V(nickel)$batt_export + 1)
+
+## ------- COVERAGE -------
+cat("\n=== Attribute coverage ===\n")
+cat("EPI           matched:", sum(!is.na(igraph::V(nickel)$epi_score)),   "/", igraph::vcount(nickel), "\n")
+cat("GDP           matched:", sum(!is.na(igraph::V(nickel)$gdp_usd)),     "/", igraph::vcount(nickel), "\n")
+cat("LSCI          matched:", sum(!is.na(igraph::V(nickel)$lsci)),        "/", igraph::vcount(nickel), "\n")
+cat("EV exports    matched:", sum(!is.na(igraph::V(nickel)$ev_export)),   "/", igraph::vcount(nickel), "\n")
+cat("Battery exp.  matched:", sum(!is.na(igraph::V(nickel)$batt_export)), "/", igraph::vcount(nickel), "\n")
+
+
+```
+
+```{r build network with attributes}
+
+## ------- DESCRIPTIVES -------
+if ("snafun" %in% rownames(utils::installed.packages())) {
+  try(snafun::print(nickel), silent = TRUE)
+  nickelsummary <- try(snafun::g_summary(nickel), silent = TRUE)
+  if (!inherits(nickelsummary, "try-error")) print(nickelsummary)
+} else {
+  print(nickel)
+  cat("\n(No 'snafun' found; printed igraph object instead.)\n")
+}
+
+
+## ------- BUILD 'nw' NETWORK OBJECT AND COPY NODE ATTRIBUTES -------
+
+nw <- network::network(A, directed = TRUE, matrix.type = "adjacency")
+
+network::set.vertex.attribute(nw, "country_name",  igraph::V(nickel)$country_name)
+network::set.vertex.attribute(nw, "epi_score",     igraph::V(nickel)$epi_score)
+network::set.vertex.attribute(nw, "gdp_usd",       igraph::V(nickel)$gdp_usd)
+network::set.vertex.attribute(nw, "lsci",          igraph::V(nickel)$lsci)
+network::set.vertex.attribute(nw, "ev_export",     igraph::V(nickel)$ev_export)
+network::set.vertex.attribute(nw, "batt_export",   igraph::V(nickel)$batt_export)
+network::set.vertex.attribute(nw, "ln_ev_export",  igraph::V(nickel)$ln_ev_export)
+network::set.vertex.attribute(nw, "ln_batt_export",igraph::V(nickel)$ln_batt_export)
+
+```
+
+```{r Distance matrix}
+
+## ------- CEPII DISTANCE MATRIX (DYADIC EDGE COVARIATE) -------
+
+if (!requireNamespace("foreign", quietly = TRUE)) {
+  stop("Please install the 'foreign' package to read dist_cepii.dta:\n  install.packages('foreign')")
+}
+
+# 1. READ DATA
+# Use convert.factors=FALSE to prevent countries from turning into numbers
+dist_raw <- foreign::read.dta(dist_path, convert.factors = FALSE)
+
+# 2. CLEANING (MUST HAPPEN HERE)
+# Force ISO codes to be plain text and remove hidden spaces
+dist_raw$iso_o <- trimws(as.character(dist_raw$iso_o))
+dist_raw$iso_d <- trimws(as.character(dist_raw$iso_d))
+
+# Map "Zaire" (ZAR) -> Dem. Rep. Congo (COD)
+dist_raw$iso_o[dist_raw$iso_o == "ZAR"] <- "COD"
+dist_raw$iso_d[dist_raw$iso_d == "ZAR"] <- "COD"
+
+# Map "Romania" (ROM) -> Romania (ROU)
+dist_raw$iso_o[dist_raw$iso_o == "ROM"] <- "ROU"
+dist_raw$iso_d[dist_raw$iso_d == "ROM"] <- "ROU"
+
+# Map "Serbia and Montenegro" (SCG) / Yugoslavia (YUG) -> Serbia (SRB)
+dist_raw$iso_o[dist_raw$iso_o %in% c("SCG", "YUG")] <- "SRB"
+dist_raw$iso_d[dist_raw$iso_d %in% c("SCG", "YUG")] <- "SRB"
+
+# 3. FILTERING
+all_iso <- igraph::V(nickel)$name
+
+# Keep only pairs where both origin and destination are in our network
+keep_dist <- dist_raw$iso_o %in% all_iso & dist_raw$iso_d %in% all_iso
+dist_sub  <- dist_raw[keep_dist, , drop = FALSE]
+
+# 4. BUILD MATRIX
+dist_mat <- matrix(NA_real_,
+                   nrow = length(all_iso),
+                   ncol = length(all_iso),
+                   dimnames = list(all_iso, all_iso))
+
+# Create index map
+idx_o <- match(dist_sub$iso_o, all_iso)
+idx_d <- match(dist_sub$iso_d, all_iso)
+
+# Fill the matrix
+for (k in seq_len(nrow(dist_sub))) {
+  i <- idx_o[k]
+  j <- idx_d[k]
+  if (!is.na(i) && !is.na(j)) {
+    val <- dist_sub$distw[k]   # population-weighted distance in km
+    dist_mat[i, j] <- val
+    dist_mat[j, i] <- val      # enforce symmetry
+  }
+}
+
+diag(dist_mat) <- 0
+
+# 5. DIAGNOSTIC CHECK
+cat("\nDistance Matrix Rebuilt.\n")
+cat("Total dyads:", length(dist_mat), "\n")
+cat("Missing dyads:", sum(is.na(dist_mat)), "\n")
+cat("Success rate:", 100 * (1 - sum(is.na(dist_mat))/length(dist_mat)), "%\n")
+
+```
+
+```{r fill in missing values attributes}
+## =========================================================================
+## DATA COVERAGE CHECK
+## =========================================================================
+
+# 1. EPI Score (Environmental Performance)
+cat("EPI matched:       ", sum(!is.na(igraph::V(nickel)$epi_score)),    "/", igraph::vcount(nickel), "\n")
+
+# 2. GDP (Economic Size)
+cat("GDP matched:       ", sum(!is.na(igraph::V(nickel)$gdp_usd)),      "/", igraph::vcount(nickel), "\n")
+
+# 3. LSCI (Shipping Connectivity)
+cat("LSCI matched:      ", sum(!is.na(igraph::V(nickel)$lsci)),         "/", igraph::vcount(nickel), "\n")
+
+# 4. EV Exports (Downstream Industry)
+cat("EV Exp matched:    ", sum(!is.na(igraph::V(nickel)$ev_export)),    "/", igraph::vcount(nickel), "\n")
+
+# 5. Battery Exports (Upstream Industry)
+cat("Batt Exp matched:  ", sum(!is.na(igraph::V(nickel)$batt_export)),  "/", igraph::vcount(nickel), "\n")
+
+
+
+# Get list of all country names in the network
+node_names <- igraph::V(nickel)$country_name 
+
+# 1. Check who is missing EPI
+missing_epi <- node_names[is.na(igraph::V(nickel)$epi_score)]
+cat("Countries missing EPI:\n")
+print(missing_epi)
+
+# 2. Check who is missing GDP
+missing_gdp <- node_names[is.na(igraph::V(nickel)$gdp_usd)]
+cat("\nCountries missing GDP:\n")
+print(missing_gdp)
+
+# 3. Check who is missing LSCI
+missing_lsci <- node_names[is.na(igraph::V(nickel)$lsci)]
+cat("\nCountries missing LSCI:\n")
+print(missing_lsci)
+
+missing_ev <- node_names[is.na(igraph::V(nickel)$ev_export)]
+cat("\nCountries missing EV export:\n")
+print(missing_ev)
+
+missing_batt <- node_names[is.na(igraph::V(nickel)$batt_export)]
+cat("\nCountries missing battery export:\n")
+print(missing_batt)
+
+
+## =========================================================================
+## FINAL DATA PATCH (Run this to fix the remaining NAs)
+## =========================================================================
+
+# --- 1. Fix LSCI (Landlocked Countries = 0) ---
+# These countries have no sea ports, so their shipping connectivity is 0.
+landlocked_list <- c("Austria", "Azerbaijan", "Bolivia (Plurinational State of)",
+                     "Botswana", "Switzerland", "Czechia", "Hungary",
+                     "Kazakhstan", "Luxembourg", "Serbia", "Slovakia",
+                     "Zambia", "Zimbabwe")
+
+igraph::V(nickel)$lsci[igraph::V(nickel)$country_name %in% landlocked_list] <- 0
+
+
+# --- 2. Fix GDP (South Korea & New Caledonia) ---
+# South Korea is a major economy, we must find its real value.
+# We look for "Korea, Rep." in the raw GDP data and assign it to "Rep. of Korea"
+val_korea <- gdp_raw[[gdp_col]][grep("Korea, Rep", gdp_raw[[country_col]])]
+if(length(val_korea) > 0) {
+  val_korea_clean <- as.numeric(gsub("[^0-9.-]", "", val_korea[1]))
+  igraph::V(nickel)$gdp_usd[igraph::V(nickel)$country_name == "Rep. of Korea"] <- val_korea_clean
+}
+
+# New Caledonia is a small island territory (~$9.6 Billion), often missing in main GDP lists.
+# We set this manually so it doesn't get the huge global average.
+igraph::V(nickel)$gdp_usd[igraph::V(nickel)$country_name == "New Caledonia"] <- 9.6e9
+
+
+# --- 3. Fix Exports (Missing = 0) ---
+# Countries like Bolivia, Russia, Vietnam likely exported 0 EVs/Batteries in this specific year.
+igraph::V(nickel)$ev_export[is.na(igraph::V(nickel)$ev_export)] <- 0
+igraph::V(nickel)$batt_export[is.na(igraph::V(nickel)$batt_export)] <- 0
+
+
+# --- 4. Final Imputation (Fill small islands with Mean) ---
+# This handles "Cayman Isds" (GDP/EPI) and "Hong Kong" (EPI).
+fill_mean <- function(x) { x[is.na(x)] <- mean(x, na.rm = TRUE); return(x) }
+
+igraph::V(nickel)$epi_score <- fill_mean(igraph::V(nickel)$epi_score)
+igraph::V(nickel)$gdp_usd   <- fill_mean(igraph::V(nickel)$gdp_usd) # Catches Cayman
+igraph::V(nickel)$lsci      <- fill_mean(igraph::V(nickel)$lsci)    # Catches any stragglers
+
+
+# --- 5. Re-calculate Log Transforms ---
+# Essential: Update the logs now that the base values (0s) are fixed
+igraph::V(nickel)$ln_ev_export   <- log(igraph::V(nickel)$ev_export + 1)
+igraph::V(nickel)$ln_batt_export <- log(igraph::V(nickel)$batt_export + 1)
+
+
+cat("\n--- FINAL VERIFICATION (Target: 0) ---\n")
+cat("Missing EPI:       ", sum(is.na(igraph::V(nickel)$epi_score)), "\n")
+cat("Missing GDP:       ", sum(is.na(igraph::V(nickel)$gdp_usd)), "\n")
+cat("Missing LSCI:      ", sum(is.na(igraph::V(nickel)$lsci)), "\n")
+cat("Missing EV Exp:    ", sum(is.na(igraph::V(nickel)$ev_export)), "\n")
+cat("Missing Batt Exp:  ", sum(is.na(igraph::V(nickel)$batt_export)), "\n")
+
+## =========================================================================
+## 1. CLEANING: REMOVE "XX" (THE UNKNOWN COUNTRY)
+## =========================================================================
+
+# Remove "XX" from the igraph object (if it exists)
+if ("XX" %in% igraph::V(nickel)$name) {
+  nickel <- igraph::delete_vertices(nickel, "XX")
+  cat("Removed 'XX' from nickel (igraph) object.\n")
+}
+
+# Remove "XX" from the network object (used for MRQAP)
+# We rebuild 'nw' to be safe and ensure attributes are clean
+# (Assuming 'nickel' has all the correct attributes attached from previous steps)
+# We convert the adjacency matrix of the CLEAN nickel object
+clean_mat <- igraph::as_adjacency_matrix(nickel, attr="weight", sparse=FALSE)
+nw <- network::network(clean_mat, directed=TRUE)
+
+# Re-attach attributes to the clean network object
+network::set.vertex.attribute(nw, "epi_score", igraph::V(nickel)$epi_score)
+network::set.vertex.attribute(nw, "gdp_usd", igraph::V(nickel)$gdp_usd)
+network::set.vertex.attribute(nw, "lsci", igraph::V(nickel)$lsci)
+
+# Get the new, clean list of countries
+target_order <- network::network.vertex.names(nw)
+n_nodes <- length(target_order)
+
+cat("New Network Size (without XX):", n_nodes, "\n")
+```
+```{r summary}
+snafun::g_summary(nickel, directed = TRUE)
+```
+
+
+```{r }
+## PLOT ----------------------------------------
+
+set.seed(1)
+in_str <- igraph::strength(nickel, mode = "in")
+rng <- max(in_str) - min(in_str)
+vsize <- 3 + 8 * (in_str - min(in_str)) / (rng + 1e-9)
+
+graphics::plot(
+  nickel,
+  vertex.size = 3,                 
+  vertex.frame.color = NA,
+  vertex.label.cex = 0.6,
+  edge.arrow.size = 0.35,
+  main = "Nickel trade"
+)
+
+```
+
+```{r rebuild matrix}
+
+## =========================================================================
+## 2. REBUILD MATRICES (Using the Clean List)
+## =========================================================================
+
+# --- A. Distance Matrix (Robust Alignment) ---
+
+# Ensure dist_mat exists
+if(!exists("dist_mat")) stop("dist_mat is missing. Please run the distance creation block first.")
+
+# Create clean container
+new_dist_mat <- matrix(NA, nrow=n_nodes, ncol=n_nodes)
+rownames(new_dist_mat) <- target_order
+colnames(new_dist_mat) <- target_order
+
+# Copy available data
+existing_names <- rownames(dist_mat)
+common_nodes <- intersect(target_order, existing_names)
+new_dist_mat[common_nodes, common_nodes] <- dist_mat[common_nodes, common_nodes]
+
+log_dist_mat <- log(new_dist_mat + 1)
+
+# --- B. Attribute Matrices ---
+# EPI Difference
+epi_vec <- network::get.vertex.attribute(nw, "epi_score")
+epi_vec[is.na(epi_vec)] <- mean(epi_vec, na.rm=TRUE)
+epi_diff_mat <- abs(outer(epi_vec, epi_vec, "-"))
+
+# GDP Product
+gdp_vec <- network::get.vertex.attribute(nw, "gdp_usd")
+gdp_vec[is.na(gdp_vec)] <- mean(gdp_vec, na.rm=TRUE)
+gdp_prod_mat <- log(outer(gdp_vec, gdp_vec, "*"))
+
+# LSCI Sum
+lsci_vec <- network::get.vertex.attribute(nw, "lsci")
+lsci_vec[is.na(lsci_vec)] <- mean(lsci_vec, na.rm=TRUE)
+lsci_mat <- outer(lsci_vec, lsci_vec, "+")
+
+# Dependent Variable (Trade Volume)
+net_mat <- as.matrix(nw)
+log_trade_mat <- log(net_mat + 1)
+
+
+
+```
+
+```{r}
+snafun::plot_centralities(
+  net      = nickel,
+  measures = c("betweenness", "closeness", "degree", "eccentricity"),
+  directed = TRUE,   
+  mode     = "out",  
+  rescaled = FALSE  
+)
+```
+
+```{r}
+snafun::g_summary(nickel)
+summary(nickel)
+
+```
+
+
+
+
+#THE START OF THE HYPOTHESES TESTING
+
+```{r STUDY 1 MRQAP}
+
+cat("\n--- Running MRQAP (Clean) ---\n")
+
+mrqap_model <- sna::netlm(
+  y = log_trade_mat, 
+  x = list(epi_diff_mat, gdp_prod_mat, lsci_mat, log_dist_mat),
+  reps = 1000, 
+  intercept = TRUE
+)
+
+names(mrqap_model$coefficients) <- c("Intercept", "EPI_Diff", "GDP_Prod", "LSCI_Sum", "Distance")
+print(summary(mrqap_model))
+
+```
+
+```{r}
+cat("\n--- MRQAP permutation diagnostics ---\n")
+
+# Coefficient permutation distributions as matrix
+
+coef_names <- names(mrqap_model$coefficients)
+k          <- length(coef_names)
+reps       <- length(mrqap_model$dist) / k
+
+dist_mat <- matrix(mrqap_model$dist, nrow = reps, ncol = k)
+colnames(dist_mat) <- coef_names
+
+## Trace-style plots: perm index vs permuted coef
+
+par(mfrow = c(ceiling(k / 2), 2))
+
+for (j in seq_len(k)) {
+plot(
+dist_mat[, j],
+type = "l",
+xlab = "Permutation index",
+ylab = "Permuted coefficient",
+main = coef_names[j]
+)
+abline(
+h   = mrqap_model$coefficients[j],
+lwd = 2, lty = 2, col = "red"
+)
+}
+
+par(mfrow = c(1, 1))
+
+## Histograms of permutation distributions + observed coef
+
+par(mfrow = c(ceiling(k / 2), 2))
+
+for (j in seq_len(k)) {
+hist(
+dist_mat[, j],
+breaks = 40,
+main   = paste("Permutation dist. for", coef_names[j]),
+xlab   = "Permuted coefficient"
+)
+abline(
+v   = mrqap_model$coefficients[j],
+lwd = 2, col = "red"
+)
+}
+
+
+```
+
+```{r, MRQAP dyad-level GOF statistics}
+cat("\n--- MRQAP dyad-level GOF statistics ---\n")
+
+# Dyad-level fitted values and residuals from netlm
+
+y_hat <- mrqap_model$fitted.values
+resid <- mrqap_model$residuals
+y_vec <- y_hat + resid   # reconstruct observed dyad vector
+
+n <- length(y_vec)
+p <- length(mrqap_model$coefficients) - as.integer(mrqap_model$intercept)
+
+sse <- sum(resid^2)
+sst <- sum((y_vec - mean(y_vec))^2)
+
+R2        <- 1 - sse / sst
+adjR2     <- 1 - (1 - R2) * ((n - 1) / (n - p - 1))
+RMSE      <- sqrt(sse / n)
+MAE       <- mean(abs(resid))
+cor_y_hat <- stats::cor(y_vec, y_hat)
+
+mrqap_gof <- c(
+R2        = R2,
+adjR2     = adjR2,
+RMSE      = RMSE,
+MAE       = MAE,
+cor_y_hat = cor_y_hat
+)
+
+print(round(mrqap_gof, 3))
+
+```
+
+```{r, prep ERGM }
+# 1. Prepare Binary Network
+clean_mat <- igraph::as_adjacency_matrix(nickel, attr="weight", sparse=FALSE)
+bin_mat <- clean_mat
+print(clean_mat)
+bin_mat[bin_mat > 0] <- 1 
+nw_binary <- network::network(bin_mat, directed = TRUE)
+print(bin_mat)
+
+# 2. Attach Attributes
+# Main Hypothesis Variables
+network::set.vertex.attribute(nw_binary, "ln_ev_export", igraph::V(nickel)$ln_ev_export)
+network::set.vertex.attribute(nw_binary, "ln_batt_export", igraph::V(nickel)$ln_batt_export)
+# Controls
+network::set.vertex.attribute(nw_binary, "ln_gdp", log(igraph::V(nickel)$gdp_usd + 1))
+
+num_cores <- parallel::detectCores()-2
+options(ergm.parallel = num_cores)
+
+```
+
+```{r, ERGM model 1}
+# --- MODEL 1: Baseline---
+cat("\nRunning Model 1 (Edges only)...\n")
+
+model_1 <- ergm::ergm(nw_binary ~ edges, 
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 123,
+                        MCMLE.maxit = 40,
+                        parallel = num_cores,
+                        parallel.type = "PSOCK"
+                      ))
+
+```
+
+```{r, ERGM model 2}
+# --- MODEL 2: Attributes (Testing H2 & H3) ---
+cat("Running Model 2 (Attributes)...\n")
+
+model_2 <- ergm::ergm(nw_binary ~ edges + 
+                        nodeicov("ln_ev_export") +   
+                        nodeicov("ln_batt_export"),
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 1234,
+                        MCMLE.maxit = 40,
+                        parallel = num_cores,
+                        parallel.type = "PSOCK"
+                      )
+)
+```
+
+```{r, ERGM model 3}
+# --- MODEL 3: Attributes (Testing H2 & H3 + GDP Control) ---
+cat("Running Model 3 (Attributes)...\n")
+
+model_3 <- ergm::ergm(nw_binary ~ edges + 
+                        nodeicov("ln_ev_export") +  
+                        nodeicov("ln_batt_export") + 
+                        nodeicov("ln_gdp") +         
+                        nodeocov("ln_gdp"),         
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 12346,
+                        MCMLE.maxit = 40,
+                        parallel = num_cores,
+                        parallel.type = "PSOCK"
+                      )
+)
+
+```
+
+```{r, ERGM model 4a}
+# --- MODEL 4a: final model a with istars ---
+cat("Running Model 4a (Attributes)...\n")
+model_4a <- ergm::ergm(nw_binary ~ edges + 
+                        nodeicov("ln_ev_export") +  
+                        nodeicov("ln_batt_export") + 
+                        nodeicov("ln_gdp") +         
+                        nodeocov("ln_gdp") +
+                        istar(2) +
+                        istar(3),         
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 12349,
+                        MCMLE.maxit = 40,
+                        parallel = num_cores,
+                        MCMLE.steplength = 0.2,
+                        parallel.type = "PSOCK"
+                      ))
+
+```
+
+```{r, ERGM model 4b}
+# --- MODEL 4b: final model a with ostars ---
+cat("Running Model 4b (Attributes)...\n")
+model_4b <- ergm::ergm(nw_binary ~ edges + 
+                        nodeicov("ln_ev_export") +   
+                        nodeicov("ln_batt_export") + 
+                        nodeicov("ln_gdp") +         
+                        nodeocov("ln_gdp") +
+                        ostar(2) +
+                        ostar(3),         
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 12345,
+                        MCMLE.maxit = 40,
+                        parallel = num_cores,
+                        MCMLE.steplength = 0.2,
+                        parallel.type = "PSOCK"
+                      )
+)
+
+```
+
+
+
+```{r, ERGM MCMC and GOF model 4a, fig.width = 10}
+
+ergm::mcmc.diagnostics(model_4a)
+
+gof_model_4a <- ergm::gof(model_4a)
+snafun::stat_plot_gof(gof_model_4a)
+gof_model_4a
+
+```
+
+```{r, ERGM MCMC and GOF model 4b, fig.width = 10}
+
+ergm::mcmc.diagnostics(model_4b)
+
+gof_model_4b <- ergm::gof(model_4b)
+snafun::stat_plot_gof(gof_model_4b)
+gof_model_4b
+
+```
+
+```{r, ERGM model 4b_extra}
+
+model_4b_extra <- ergm::ergm(nw_binary ~ edges +
+                        nodeicov("ln_ev_export") +
+                        nodeicov("ln_batt_export") +
+                        nodeicov("ln_gdp") +
+                        nodeocov("ln_gdp") +
+                        ostar(2) +
+                        ostar(3),
+                      control = ergm::control.ergm(
+                        MCMC.burnin = 7000,
+                        MCMC.samplesize = 20000,
+                        seed = 1234578,
+                        MCMLE.maxit = 2,
+                        parallel = num_cores,
+                        MCMLE.steplength = 0.2,
+                        parallel.type = "PSOCK"
+                      )
+)
+
+```
+
+
+```{r, ERGM MCMC and GOF, fig.width = 10}
+
+ergm::mcmc.diagnostics(model_4b_extra)
+
+gof_model_4b_extra <- ergm::gof(model_4b_extra)
+snafun::stat_plot_gof(gof_model_4b_extra)
+gof_model_4b_extra
+```
+
+
+```{r, ERGM compare model results}
+texreg::screenreg(list(model_1, model_2, model_3, model_4a, model_4b), 
+                  custom.model.names = c("Model 1", "Model 2", "Model 3", "Model 4a", "Model 4b"))
+
+``` 
+
+
+
